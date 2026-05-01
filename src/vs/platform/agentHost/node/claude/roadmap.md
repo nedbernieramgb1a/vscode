@@ -223,7 +223,7 @@ Exit criteria: `curl` against the proxy with `Bearer <nonce>.test` returns the
 same payload shape Anthropic would, and `ICopilotApiService` sees the right
 calls.
 
-### Phase 3 — Claude Agent SDK integration spike
+### Phase 3 — Claude Agent SDK integration spike ✅ **DONE**
 
 A throw-away spike that proves the SDK can be pointed at `IClaudeProxyService`
 and complete a tool-using turn end-to-end. **Not** an `IAgent` implementation
@@ -257,6 +257,87 @@ findings update Phase 6/8/9 plans.
 
 Exit criteria: an SDK-driven session completes one turn through the proxy,
 including at least one tool call round-trip, with no traffic to anthropic.com.
+
+#### Phase 3 — Findings (2026-05-01) ✅ DONE
+
+Spike at `src/vs/platform/agentHost/node/claude/scripts/spike.ts` (local-only,
+not committed; see `.git/info/exclude`). Pivoted from the original real-CAPI
+plan because `gh auth token` cannot reach `copilot_internal/v2/token` (that
+endpoint requires a token issued by VS Code's Copilot OAuth client). Real
+proxy + real SDK + real subprocess + real in-process MCP server were exercised;
+only the upstream `ICopilotApiService` was stubbed (Phase 2's manual procedure
+already validated proxy ↔ real CAPI). Run with `tsx --tsconfig src/tsconfig.json`
+from `extensions/copilot/node_modules/.bin/`.
+
+Validated:
+
+1. **SDK ↔ proxy wiring works as designed.** Setting `ANTHROPIC_BASE_URL`
+   and `ANTHROPIC_AUTH_TOKEN` via `Options.env` is sufficient — the SDK
+   never resolved `api.anthropic.com`, and the proxy received both the
+   first turn and the post-tool-result follow-up turn (2 calls to the
+   stubbed `ICopilotApiService.messages()`).
+2. **SDK chooses `node`+`cli.js` cleanly when forced.** Passing
+   `pathToClaudeCodeExecutable: <abs path to cli.js>` plus
+   `executable: 'node'` makes the spawn deterministic. Captured spawn args:
+   `node /…/claude-agent-sdk/cli.js --output-format stream-json --verbose …`
+3. **`spawnClaudeCodeProcess` hook is the right interception point.** The
+   hook receives an already-prepared `{ command, args, cwd, env }`; we
+   forwarded to `child_process.spawn` unchanged and the SDK was happy. Use
+   this hook (not in-process `net.connect` patches) for any future child-
+   process instrumentation.
+4. **Tool round-trip is fully end-to-end.** Sequence observed:
+   `system/init` → `assistant`(tool_use mcp__spike__echo) → echo handler
+   invoked with correct args → `user`(tool_result) → `assistant`(text) →
+   `result/success`. The proxy's pass-through of streaming events
+   (including `input_json_delta` for tool input) is byte-compatible with
+   what the SDK consumes.
+5. **`Query` control surface exists in 0.2.112.** All of `interrupt`,
+   `setModel`, `setPermissionMode`, `streamInput`, `rewindFiles`,
+   `supportedModels`, `close` are present as functions on the returned
+   `Query`. (Existence only — invocation behavior to be validated in
+   Phase 6+ when called mid-session.)
+6. **`enableFileCheckpointing` + `rewindFiles()` are present.** Phase 8
+   can rely on them; no need for an alternate mechanism.
+7. **Zero `*.anthropic.com` leaks.** `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+   is honored — no DNS attempts, no failed connections, no error events on
+   the SDK stream.
+8. **`NODE_OPTIONS` is NOT inherited by the child** unless explicitly set
+   in `Options.env`. (Confirms council R1: a `--require <tracer>` preload
+   strategy from the parent process WOULD NOT work; instrumentation must
+   go through `Options.env.NODE_OPTIONS` or `spawnClaudeCodeProcess`.)
+9. **Streaming-input mode (prompt: AsyncIterable) is the right choice.**
+   `Query` exposes the streaming-only methods (`setModel`,
+   `setPermissionMode`, etc.) only when `prompt` is an async iterable —
+   single-string prompts produce a different `Query` shape.
+10. **Required `Options` for Phase 4:** `cwd`, `executable: 'node'`,
+    `pathToClaudeCodeExecutable`, `permissionMode: 'bypassPermissions'`
+    + `allowDangerouslySkipPermissions: true` (for SDK isolation; real
+    permission UX is `canUseTool`), `systemPrompt: { type: 'preset',
+    preset: 'claude_code' }`, `settingSources: []` (SDK isolation —
+    don't inherit user settings under the agent host), `env`
+    (ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN,
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1), `mcpServers`,
+    `model`, and `abortController`.
+
+Open items for Phase 4+:
+
+- **Real abort behavior** — surface only validated, not exercised.
+  AbortController vs `Query.interrupt()` semantics (which one drains the
+  generator cleanly, which one orphans the subprocess) is still
+  unanswered. Defer to first integration test in Phase 4.
+- **Real CAPI bring-up** — Phase 4 will use real auth via the
+  `authenticate` RPC path (cf. `toolApprovalRealSdk.integrationTest.ts`),
+  which sidesteps the `gh auth token` limitation by routing through the
+  agent host's existing GitHub authentication channel.
+- **Per-turn `count_tokens` calls** — proxy returns 501 for these. Spike
+  saw none during a normal turn; if Phase 4 integration sees the SDK
+  call `count_tokens` (e.g. when context-window pressure is high), the
+  proxy will need real support or an SDK-side opt-out.
+- **Child stderr is empty even with `NODE_DEBUG=net,dns,http,https` set**
+  in `Options.env`. Either the SDK's `stderr` callback only catches
+  certain log streams, or the SDK strips `NODE_DEBUG` before spawning.
+  Worth confirming during Phase 4 if we ever need child-process trace
+  visibility.
 
 ### Phase 4 — `ClaudeAgent` skeleton implementing `IAgent`
 
